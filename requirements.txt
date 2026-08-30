@@ -6,4 +6,5 @@ python-dotenv
 gunicorn
 psycopg2-binary
 sentencepiece
-sacremoses 
+sacremoses
+ctranslate2==4.8.1 

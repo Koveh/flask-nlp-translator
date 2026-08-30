@@ -9,6 +9,8 @@ import psutil
 import json
 from pathlib import Path
 
+from marian_ct2 import MarianCt2Translator
+
 # Load model directly
 #from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -23,6 +25,8 @@ HISTORY_FILE = Path('translation_history.json')
 
 # 2024 Helsinki OPUS-MT (opus-mt-tc-bible-big). One hub covers de↔en.
 HUB_GMW_DEU_ENG_NLD = "Helsinki-NLP/opus-mt-tc-bible-big-gmw-deu_eng_nld"
+CT2_GMW_DIR = Path(__file__).resolve().parent / "models" / "ct2-gmw-int8"
+CT2_DIRS = {HUB_GMW_DEU_ENG_NLD: CT2_GMW_DIR}
 CURRENT_MODEL = "gmw-de-en"
 TARGET_ISO3 = {"en": "eng", "de": "deu", "ru": "rus", "nl": "nld"}
 LEGACY_MODEL_ALIASES = {
@@ -55,6 +59,15 @@ MODEL_LIST = [
 ]
 
 
+def load_hub_translator(hub: str):
+    ct2_dir = CT2_DIRS.get(hub)
+    if ct2_dir is not None and (ct2_dir / "model.bin").is_file():
+        print(f"Loading CTranslate2 INT8: {ct2_dir}")
+        return MarianCt2Translator(ct2_dir, tokenizer_id=hub)
+    print(f"Loading Helsinki transformers: {hub}")
+    return pipeline("translation", model=hub)
+
+
 def find_model(model_value: str):
     if not model_value:
         return None
@@ -85,8 +98,7 @@ for model in MODEL_LIST:
     hub = model["hub"]
     if hub not in HUB_PIPES:
         try:
-            print(f"Loading Helsinki model: {hub}")
-            HUB_PIPES[hub] = pipeline("translation", model=hub)
+            HUB_PIPES[hub] = load_hub_translator(hub)
         except Exception as e:
             print(f"Ошибка загрузки модели {hub}: {str(e)}")
             HUB_PIPES[hub] = None
@@ -259,11 +271,13 @@ def translate():
         end_time = time.time()
         duration_ms = int((end_time - start_time) * 1000)
         
+        translator = selected_model.get("pipe")
         response_data = {
             "translated_text": actual_text, 
             "source_language": selected_model["from"], 
             "target_language": selected_model["to"],
             "model": selected_model.get("hub") or selected_model["value"],
+            "engine": getattr(translator, "engine", "transformers"),
             "time": end_time
         }
         
