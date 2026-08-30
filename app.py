@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 import os
 from dotenv import load_dotenv
 import time
+import hashlib
+import psycopg2
 from transformers import pipeline
 import psutil
 import json
@@ -18,23 +20,77 @@ load_dotenv()
 app = Flask(__name__)
 
 HISTORY_FILE = Path('translation_history.json')
-CURRENT_MODEL = "Helsinki-NLP/opus-mt-de-en"
+
+# 2024 Helsinki OPUS-MT (opus-mt-tc-bible-big). One hub covers de↔en.
+HUB_GMW_DEU_ENG_NLD = "Helsinki-NLP/opus-mt-tc-bible-big-gmw-deu_eng_nld"
+CURRENT_MODEL = "gmw-de-en"
+TARGET_ISO3 = {"en": "eng", "de": "deu", "ru": "rus", "nl": "nld"}
+LEGACY_MODEL_ALIASES = {
+    "Helsinki-NLP/opus-mt-de-en": "gmw-de-en",
+    "Helsinki-NLP/opus-mt-en-de": "gmw-en-de",
+}
+
+# Настройки базы данных
+DATABASE_URL = "postgresql://koveh:Daniil77Daniil@65.109.88.77:5432/koveh"
 
 MODEL_LIST = [
-   {"name": "Helsinki-NLP/opus-mt-de-en", "value": "Helsinki-NLP/opus-mt-de-en", "description": "German-English", "from": "de", "to": "en", "icon": "🇩🇪🇬🇧"},
-#    {"name": "Helsinki-NLP/opus-mt-en-de", "value": "Helsinki-NLP/opus-mt-en-de", "description": "English-German", "from": "en", "to": "de", "icon": "🇬🇧🇩🇪"},
-#    {"name": "Helsinki-NLP/opus-mt-fr-en", "value": "Helsinki-NLP/opus-mt-fr-en", "description": "French-English", "from": "fr", "to": "en", "icon": "🇫🇷🇧"},
-#    {"name": "Helsinki-NLP/opus-mt-ru-en", "value": "Helsinki-NLP/opus-mt-ru-en", "description": "Russian-English", "from": "ru", "to": "en", "icon": "🇷🇺🇬🇧"},
-#    {"name": "Helsinki-NLP/opus-mt-en-ru", "value": "Helsinki-NLP/opus-mt-en-ru", "description": "English-Russian", "from": "en", "to": "ru", "icon": "🇬🇧🇷🇺"}
+    {
+        "name": HUB_GMW_DEU_ENG_NLD,
+        "value": "gmw-de-en",
+        "hub": HUB_GMW_DEU_ENG_NLD,
+        "description": "German-English",
+        "from": "de",
+        "to": "en",
+        "icon": "🇩🇪🇬🇧",
+    },
+    {
+        "name": HUB_GMW_DEU_ENG_NLD,
+        "value": "gmw-en-de",
+        "hub": HUB_GMW_DEU_ENG_NLD,
+        "description": "English-German",
+        "from": "en",
+        "to": "de",
+        "icon": "🇬🇧🇩🇪",
+    },
 ]
 
-# for each model in MODEL_LIST
+
+def find_model(model_value: str):
+    if not model_value:
+        return None
+    aliased = LEGACY_MODEL_ALIASES.get(model_value, model_value)
+    for model in MODEL_LIST:
+        if model["value"] == aliased:
+            return model
+    for model in MODEL_LIST:
+        if model.get("hub") == aliased:
+            return model
+    return None
+
+
+def find_model_for_pair(source_lang: str, target_lang: str):
+    return next(
+        (model for model in MODEL_LIST if model["from"] == source_lang and model["to"] == target_lang),
+        None,
+    )
+
+
+def with_target_tag(text: str, target_lang: str) -> str:
+    tag = TARGET_ISO3.get(target_lang, target_lang)
+    return f">>{tag}<< {text}"
+
+
+HUB_PIPES = {}
 for model in MODEL_LIST:
-    try:
-        model["pipe"] = pipeline("translation", model=model["value"])
-    except Exception as e:
-        print(f"Ошибка загрузки модели {model['value']}: {str(e)}")
-        continue
+    hub = model["hub"]
+    if hub not in HUB_PIPES:
+        try:
+            print(f"Loading Helsinki model: {hub}")
+            HUB_PIPES[hub] = pipeline("translation", model=hub)
+        except Exception as e:
+            print(f"Ошибка загрузки модели {hub}: {str(e)}")
+            HUB_PIPES[hub] = None
+    model["pipe"] = HUB_PIPES.get(hub)
 
 
 def load_history():
@@ -52,6 +108,99 @@ def save_history(history_item):
     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def get_db_connection():
+    """Получить соединение с базой данных"""
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        return None
+
+def save_translation_request(request_body, response_body, request_text, response_text, provider="Helsinki-NLP"):
+    """Сохранить данные перевода"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        # Создаем хеш запроса для уникальности
+        request_str = json.dumps(request_body, sort_keys=True)
+        request_hash = hashlib.sha256(request_str.encode()).hexdigest()
+        
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO api_request_data (request_hash, request_body, response_body, request_messages, response_message)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (request_hash) DO UPDATE SET
+                    response_body = EXCLUDED.response_body,
+                    response_message = EXCLUDED.response_message,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id
+            """, (
+                request_hash,
+                json.dumps(request_body),
+                json.dumps(response_body),
+                json.dumps([{"role": "user", "content": request_text}]),
+                response_text
+            ))
+            
+            result = cursor.fetchone()
+            conn.commit()
+            return result[0] if result else None
+            
+    except Exception as e:
+        print(f"Error saving translation request: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+    
+    return None
+
+def save_translation_transaction(api_key, provider, model, method, endpoint, request_text, response_text, duration_ms, status, request_data_id, user_ip=None, user_agent=None, error_message=None):
+    """Сохранить транзакцию перевода"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        # Приблизительный подсчет токенов (символы / 4)
+        request_tokens = len(request_text) // 4 if request_text else 0
+        response_tokens = len(response_text) // 4 if response_text else 0
+        total_tokens = request_tokens + response_tokens
+        
+        # Стоимость для Helsinki-NLP (бесплатно)
+        usd_cost = 0.0  # Helsinki-NLP бесплатен
+        
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO api_transactions (
+                    user_id, api_key, provider, model, method, endpoint,
+                    request_tokens, response_tokens, total_tokens, usd_cost,
+                    request_time, response_time, duration_ms, status,
+                    request_data_id, user_ip, user_agent, error_message
+                ) VALUES (
+                    NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, %s, %s,
+                    %s, %s, %s, %s
+                ) RETURNING id
+            """, (
+                api_key or 'anonymous', provider, model, method, endpoint,
+                request_tokens, response_tokens, total_tokens, usd_cost,
+                duration_ms, status, request_data_id, user_ip, user_agent, error_message
+            ))
+            
+            result = cursor.fetchone()
+            conn.commit()
+            return result[0] if result else None
+            
+    except Exception as e:
+        print(f"Error saving translation transaction: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+    
+    return None
+
 
 @app.route("/screen_translator", methods=["POST"])
 def screen_translator():
@@ -64,17 +213,15 @@ def screen_translator():
         source_lang = data.get('source', 'de')  # default to German
         target_lang = data.get('target', 'en')  # default to English
         
-        # Find the appropriate model based on language pair
-        model_value = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
-        selected_model = next((model for model in MODEL_LIST if model["value"] == model_value), None)
+        selected_model = find_model_for_pair(source_lang, target_lang)
         
-        if not selected_model:
+        if not selected_model or not selected_model.get("pipe"):
             return jsonify({"error": f"Unsupported language pair: {source_lang}-{target_lang}"}), 400
             
         if not text.strip():
             return jsonify({"error": "Empty text"}), 400
             
-        translated_text = selected_model["pipe"](text)
+        translated_text = selected_model["pipe"](with_target_tag(text, target_lang))
         actual_text = translated_text[0]['translation_text']
         
         # Return format matching Google Translate API
@@ -89,6 +236,8 @@ def screen_translator():
     
 @app.route("/translate", methods=["POST"])
 def translate():
+    start_time = time.time()
+    
     try:
         data = request.get_json()
         if not data or 'text' not in data:
@@ -97,25 +246,85 @@ def translate():
         text = data.get('text')
         model_value = data.get('model', CURRENT_MODEL)  # Get selected model or use default
         
-        # Find the model in MODEL_LIST
-        selected_model = next((model for model in MODEL_LIST if model["value"] == model_value), None)
-        if not selected_model:
+        selected_model = find_model(model_value)
+        if not selected_model or not selected_model.get("pipe"):
             return jsonify({"error": "Invalid model"}), 400
             
         if not text.strip():
             return jsonify({"error": "Empty text"}), 400
             
-        translated_text = selected_model["pipe"](text)
+        translated_text = selected_model["pipe"](with_target_tag(text, selected_model["to"]))
         actual_text = translated_text[0]['translation_text']
         
-        return jsonify({
+        end_time = time.time()
+        duration_ms = int((end_time - start_time) * 1000)
+        
+        response_data = {
             "translated_text": actual_text, 
             "source_language": selected_model["from"], 
-            "target_language": selected_model["to"], 
-            "time": time.time()
-        })
+            "target_language": selected_model["to"],
+            "model": selected_model.get("hub") or selected_model["value"],
+            "time": end_time
+        }
+        
+        # Сохранение данных запроса и ответа
+        request_data_id = save_translation_request(
+            request_body=data,
+            response_body=response_data,
+            request_text=text,
+            response_text=actual_text,
+            provider="Helsinki-NLP"
+        )
+        
+        # Сохранение транзакции
+        save_translation_transaction(
+            api_key=request.headers.get('X-API-Key', 'anonymous'),
+            provider="Helsinki-NLP",
+            model=model_value,
+            method="POST",
+            endpoint="/translate",
+            request_text=text,
+            response_text=actual_text,
+            duration_ms=duration_ms,
+            status="completed",
+            request_data_id=request_data_id,
+            user_ip=request.remote_addr,
+            user_agent=request.headers.get('User-Agent')
+        )
+        
+        return jsonify(response_data)
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        end_time = time.time()
+        duration_ms = int((end_time - start_time) * 1000)
+        
+        # Сохранение ошибки
+        error_response = {"error": str(e)}
+        request_data_id = save_translation_request(
+            request_body=data if 'data' in locals() else {},
+            response_body=error_response,
+            request_text=data.get('text', '') if 'data' in locals() else '',
+            response_text=None,
+            provider="Helsinki-NLP"
+        )
+        
+        save_translation_transaction(
+            api_key=request.headers.get('X-API-Key', 'anonymous'),
+            provider="Helsinki-NLP",
+            model=data.get('model', CURRENT_MODEL) if 'data' in locals() else CURRENT_MODEL,
+            method="POST",
+            endpoint="/translate",
+            request_text=data.get('text', '') if 'data' in locals() else '',
+            response_text=None,
+            duration_ms=duration_ms,
+            status="error",
+            request_data_id=request_data_id,
+            user_ip=request.remote_addr,
+            user_agent=request.headers.get('User-Agent'),
+            error_message=str(e)
+        )
+        
+        return jsonify(error_response), 400
 
 @app.route("/translator", methods=["POST"])
 def translator():

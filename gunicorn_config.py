@@ -6,7 +6,8 @@ bind = "0.0.0.0:8003"
 backlog = 2048
 
 # Worker processes
-workers = 4
+# transformer-big (~0.2B) needs more RAM than opus-mt-de-en; keep 2 workers
+workers = 2
 worker_class = 'sync'
 worker_connections = 1000
 timeout = 120
