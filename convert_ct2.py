@@ -2,16 +2,27 @@
 from __future__ import annotations
 
 import logging
+from functools import wraps
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from ctranslate2.converters.transformers import TransformersConverter
 
-from marian_ct2 import logged
-
 LOGGER = logging.getLogger(__name__)
+F = TypeVar("F", bound=Callable[..., object])
 
 HUB_GMW_DEU_ENG_NLD = "Helsinki-NLP/opus-mt-tc-bible-big-gmw-deu_eng_nld"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "models" / "ct2-gmw-int8"
+SPM_FILES = ["source.spm", "target.spm"]
+
+
+def logged(fn: F) -> F:
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        LOGGER.info("%s", fn.__name__)
+        return fn(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 class MarianTransformersConverter(TransformersConverter):
@@ -26,7 +37,7 @@ class MarianTransformersConverter(TransformersConverter):
 @logged
 def convert_hub(hub_id: str, output_dir: Path, quantization: str = "int8") -> Path:
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    converter = MarianTransformersConverter(hub_id)
+    converter = MarianTransformersConverter(hub_id, copy_files=SPM_FILES)
     converter.convert(str(output_dir), quantization=quantization, force=True)
     return output_dir
 

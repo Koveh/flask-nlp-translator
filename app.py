@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 import time
 import hashlib
 import psycopg2
-from transformers import pipeline
 import psutil
 import json
 from pathlib import Path
@@ -63,7 +62,8 @@ def load_hub_translator(hub: str):
     ct2_dir = CT2_DIRS.get(hub)
     if ct2_dir is not None and (ct2_dir / "model.bin").is_file():
         print(f"Loading CTranslate2 INT8: {ct2_dir}")
-        return MarianCt2Translator(ct2_dir, tokenizer_id=hub)
+        return MarianCt2Translator(ct2_dir)
+    from transformers import pipeline
     print(f"Loading Helsinki transformers: {hub}")
     return pipeline("translation", model=hub)
 
