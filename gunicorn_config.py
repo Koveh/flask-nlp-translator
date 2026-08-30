@@ -6,7 +6,8 @@ bind = "0.0.0.0:8003"
 backlog = 2048
 
 # Worker processes
-workers = 4
+# CT2 INT8 is ~200 MB/process; keep 2 sync workers for concurrent requests
+workers = 2
 worker_class = 'sync'
 worker_connections = 1000
 timeout = 120

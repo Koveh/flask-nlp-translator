@@ -3,4 +3,8 @@ transformers
 torch
 psutil
 python-dotenv
-gunicorn 
+gunicorn
+psycopg2-binary
+sentencepiece
+sacremoses
+ctranslate2==4.8.1 
